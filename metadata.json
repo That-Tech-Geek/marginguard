@@ -1,0 +1,5 @@
+{
+  "name": "MarginGuard AI - Real-time Inference Control",
+  "description": "A live control system for AI inference costs. Simulates traffic, controls spend variance via dynamic downgrading, and forecasts runway impact using statistical modeling.",
+  "requestFramePermissions": []
+}
