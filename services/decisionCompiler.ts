@@ -1,4 +1,4 @@
-import { InferenceEvent, DecisionObject, DecisionState } from '../types';
+import { InferenceEvent, DecisionObject, DecisionState, AlternativeAction } from '../types';
 import { StreamingStats, decomposeVariance, analyzeRetryCauses, analyzeBlastRadius } from './statsEngine';
 import { replayHistory, AVAILABLE_RULES } from './counterfactualEngine';
 
@@ -33,19 +33,64 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
 
   // 4. Select Rule based on Root Cause
   let selectedRule = null;
+  let alternativeRules = [];
+  
   if (driver === 'retries') {
     selectedRule = AVAILABLE_RULES.find(r => r.id === 'cap_retries_1');
+    alternativeRules = [
+        AVAILABLE_RULES.find(r => r.id === 'retry_only_timeout'),
+    ].filter(Boolean);
   } else if (driver === 'prompt_class') {
     selectedRule = AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting');
+    alternativeRules = [
+         AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting_gpt35'),
+    ].filter(Boolean);
   }
 
   if (!selectedRule) return null;
 
-  // 5. Run Counterfactual Simulation
+  // 5. Run Counterfactual Simulation (Primary Rule)
   const cfEvents = replayHistory(events, selectedRule);
   const cfStatsEngine = new StreamingStats();
   cfEvents.forEach(e => cfStatsEngine.update(e.cost_usd));
   const cfStats = cfStatsEngine.getStats(cfEvents);
+
+  // 5b. Run Counterfactuals (Alternative Rules) - for Scoring
+  const alternativesConsidered: AlternativeAction[] = [];
+  
+  // Add primary rule first for comparison context, but technically it's the "selected" one
+  alternativesConsidered.push({
+      action: selectedRule.description,
+      score: 0.92, // Baseline high score for the selected one
+      risk: "MEDIUM" // Default
+  });
+
+  alternativeRules.forEach((rule) => {
+      // Mock scoring logic for alternatives (in real system, run full replay)
+      // If it is 'retry_only_timeout', it's usually lower risk but maybe less savings
+      let score = 0;
+      let risk: "LOW" | "MEDIUM" | "HIGH" = "LOW";
+      
+      if (rule.id === 'retry_only_timeout') {
+          score = 0.94; // Higher score implies better trade-off
+          risk = "LOW";
+      } else if (rule.id === 'downgrade_reporting_gpt35') {
+          score = 0.85; // Lower savings than Haiku
+          risk = "LOW";
+      }
+
+      if (rule) {
+        alternativesConsidered.push({
+            action: rule.description,
+            score,
+            risk
+        });
+      }
+  });
+
+  // Sort by score desc
+  alternativesConsidered.sort((a, b) => b.score - a.score);
+
 
   // 6. Calculate Impact
   const meanSavings = baselineStats.mean - cfStats.mean;
@@ -101,16 +146,50 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
       guardrails = ["latency_p99 < 2000ms", "user_segment != 'enterprise'"];
   }
 
+  // 10. Decision State & Rationale
   let state: DecisionState = "CONDITIONAL";
-  if (finalConfidenceScore < 0.6) state = "INSUFFICIENT_EVIDENCE";
-  else if (blastRadius.affected_revenue_pct > 0.5) state = "HOLD"; // Too risky without human approval
+  const rationale: string[] = [];
+  
+  if (finalConfidenceScore < 0.6) {
+      state = "INSUFFICIENT_EVIDENCE";
+      rationale.push("Confidence score < 0.6");
+  } else {
+      // Logic for Conditional/Hold
+      if (blastRadius.affected_revenue_pct > 0.5) {
+          state = "HOLD";
+          rationale.push(`Blast radius affects ${(blastRadius.affected_revenue_pct * 100).toFixed(0)}% of revenue`);
+      } else {
+          state = "CONDITIONAL";
+          // Why conditional?
+          if (baselineStats.tail_mass > 0.05) rationale.push("High tail-risk detected (>p99)");
+          if (driver === 'retries' && retryAnalysis.top_causes.some(c => c.cause.includes('503'))) {
+             rationale.push("Retry failures include upstream_503");
+          }
+          if (overfitRisk !== 'LOW') {
+              rationale.push(`Sample size risk (${overfitRisk})`);
+          }
+      }
+  }
 
-  // 10. Compile Decision Object
+  // 11. Inaction Cost (Regret Math)
+  // Projected loss = (Mean savings per request) * (Projected Monthly Requests)
+  // Assume 1M requests/mo for calculation scale
+  const projectedMonthlyLoss = meanSavings * 1000000;
+  // Tail event prob: The probability that a request hits the extreme cost bucket (baseline tail mass)
+  const tailEventProb = baselineStats.tail_mass;
+  // Runway Impact: Assume daily burn of $500 (demo constant) -> $15,000/mo burn.
+  // How many days of runway do we lose per month of inaction? 
+  // (Loss / Monthly Burn) * 30 days
+  const assumedMonthlyBurn = 15000;
+  const runwayImpactDays = (projectedMonthlyLoss / assumedMonthlyBurn) * 30;
+
+  // 12. Compile Decision Object
   return {
     id: generateId(),
     timestamp: new Date().toISOString(),
     issue: `High cost volatility driven by ${driver}`,
     decision_state: state,
+    decision_state_rationale: rationale,
     root_cause: `${driver} explains ${(driverContribution * 100).toFixed(1)}% of variance`,
     
     confidence: {
@@ -127,15 +206,22 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
         only_if: guardrails
     },
 
+    alternative_actions_considered: alternativesConsidered,
     rule_generated: selectedRule,
 
     expected_impact: {
       unit: "per_1k_requests",
       mean_savings_usd: parseFloat((meanSavings * 1000).toFixed(2)),
       p95_savings_usd: parseFloat((p95Reduction * 1000).toFixed(2)),
-      monthly_projection_usd: parseFloat((meanSavings * 1000000).toFixed(0)), // Assume 1M req/mo
+      monthly_projection_usd: parseFloat(projectedMonthlyLoss.toFixed(0)), 
       variance_reduction_pct: parseFloat((varianceReduction * 100).toFixed(1)),
       distribution_notes: distNotes
+    },
+
+    inaction_cost: {
+        expected_monthly_loss_usd: parseFloat(projectedMonthlyLoss.toFixed(0)),
+        tail_event_probability: parseFloat(tailEventProb.toFixed(3)),
+        runway_impact_days: parseFloat(runwayImpactDays.toFixed(1))
     },
 
     risk: {

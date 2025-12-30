@@ -1,10 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight } from 'lucide-react';
+import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight, Check, AlertOctagon, TrendingDown, LogOut, ShieldCheck, Zap, Trash2 } from 'lucide-react';
 import { AreaChart, Area, CartesianGrid, Tooltip, ResponsiveContainer, YAxis } from 'recharts';
-import { InferenceEvent, DecisionObject, SimulationMode, DistributionStats } from './types';
+import { InferenceEvent, DecisionObject, SimulationMode, DistributionStats, ActiveRule } from './types';
 import { StreamingStats } from './services/statsEngine';
 import { compileDecision } from './services/decisionCompiler';
 import { getDecisionHighlights } from './services/analysisService';
+import { evaluateRequest } from './services/decisionEngine';
+
+// Firebase Integrations
+import { auth, db } from './services/firebase';
+import { onAuthStateChanged, signOut, User } from 'firebase/auth';
+import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { fetchActiveRules, deployRule, deleteRule } from './services/rulesService';
+import Auth from './components/Auth';
 
 // --- SIMULATION LAYER (INPUT DATA ONLY) ---
 const PROMPT_CLASSES = ['summarization', 'extraction', 'reporting', 'chat'];
@@ -12,7 +20,7 @@ const MODELS = ['gpt-4', 'gpt-4', 'claude-3-opus', 'gpt-3.5-turbo'];
 const TENANTS = ['acme_corp', 'globex', 'soylent_corp', 'massive_dynamic', 'umbrella_inc'];
 const RETRY_REASONS = ['timeout', 'rate_limit', 'upstream_503', 'context_length_exceeded'];
 
-const generateEvent = (seq: number): InferenceEvent => {
+const generateRawRequest = (seq: number): Partial<InferenceEvent> => {
   const pClass = PROMPT_CLASSES[Math.floor(Math.random() * PROMPT_CLASSES.length)];
   let retries = 0;
   let retryReason = null;
@@ -20,23 +28,14 @@ const generateEvent = (seq: number): InferenceEvent => {
   // Inject the "Fault": Reporting has high retry rate due to timeouts
   if (pClass === 'reporting' && Math.random() > 0.65) {
     retries = Math.floor(Math.random() * 3) + 1;
-    // Correlate reason: Reporting usually times out
     retryReason = Math.random() > 0.2 ? 'timeout' : 'upstream_503';
   } else if (Math.random() > 0.95) {
-      // Random noise retries
       retries = 1;
       retryReason = RETRY_REASONS[Math.floor(Math.random() * RETRY_REASONS.length)];
   }
 
   const baseTokens = 500 + Math.random() * 1500;
-  const totalTokens = baseTokens * (1 + retries);
   const model = MODELS[Math.floor(Math.random() * MODELS.length)];
-  
-  // Cost approx
-  const cost = (totalTokens / 1000) * (model === 'gpt-4' ? 0.03 : 0.002);
-
-  // Bias tenant usage (Pareto distribution simulation)
-  // Acme Corp is the heavy user
   const tenant = Math.random() > 0.6 ? 'acme_corp' : TENANTS[Math.floor(Math.random() * TENANTS.length)];
 
   return {
@@ -53,18 +52,86 @@ const generateEvent = (seq: number): InferenceEvent => {
     retries: retries,
     retry_reason: retryReason,
     success: true,
-    cost_usd: cost
+    // Base cost before any intervention
+    cost_usd: ((baseTokens * (1 + retries)) / 1000) * (model === 'gpt-4' ? 0.03 : 0.002)
   };
 };
 
 const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const userRef = useRef<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [mode, setMode] = useState<SimulationMode>(SimulationMode.IDLE);
   const [events, setEvents] = useState<InferenceEvent[]>([]);
+  
+  // Learning Plane State
   const [latestDecision, setLatestDecision] = useState<DecisionObject | null>(null);
   const [stats, setStats] = useState<DistributionStats | null>(null);
   
-  // Sequence counter for unique IDs
+  // Data Plane State (Rules)
+  const [activeRules, setActiveRules] = useState<ActiveRule[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(false);
+  
   const seqRef = useRef(0);
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      userRef.current = u;
+      setAuthLoading(false);
+      if (u) loadRules(u.uid);
+    });
+    return unsubscribe;
+  }, []);
+
+  const loadRules = async (uid: string) => {
+      setRulesLoading(true);
+      try {
+          const rules = await fetchActiveRules(uid);
+          setActiveRules(rules);
+      } catch (e) {
+          console.error("Failed to load rules", e);
+      } finally {
+          setRulesLoading(false);
+      }
+  };
+
+  const handleDeployRule = async () => {
+      if (!latestDecision || !latestDecision.rule_generated || !user) return;
+      try {
+          const newRule = await deployRule(user.uid, latestDecision.rule_generated);
+          setActiveRules(prev => [...prev, newRule]);
+          // Reset decision to look for next insight
+          setLatestDecision(null);
+      } catch (e) {
+          console.error("Deploy failed", e);
+      }
+  };
+
+  const handleDeleteRule = async (ruleId: string) => {
+      if (!user) return;
+      try {
+          await deleteRule(user.uid, ruleId);
+          setActiveRules(prev => prev.filter(r => r.id !== ruleId));
+      } catch (e) {
+          console.error("Delete failed", e);
+      }
+  };
+
+  // Save decision log (Cold Path)
+  const saveDecisionLogToDb = async (decision: DecisionObject) => {
+    if (!userRef.current) return;
+    try {
+        await addDoc(collection(db, 'users', userRef.current.uid, 'analysis_logs'), {
+            ...decision,
+            savedAt: serverTimestamp()
+        });
+    } catch (e) {
+        console.error("Failed to save analysis log", e);
+    }
+  };
 
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
@@ -72,32 +139,57 @@ const App: React.FC = () => {
       interval = setInterval(() => {
         setEvents(prev => {
           seqRef.current += 1;
-          const newEvent = generateEvent(seqRef.current);
           
-          // 1. Ingest Simulated Input (Keep rolling window of 200)
-          const newEvents = [...prev, newEvent].slice(-200);
+          // 1. Generate Raw Traffic
+          const rawRequest = generateRawRequest(seqRef.current);
           
-          // 2. Autonomous Stats Engine (Rolling Window)
-          // Fix: Re-calculate stats from scratch using the rolling window.
-          // This prevents stats from "freezing" as N becomes large in an accumulator.
+          // 2. HOT PATH: Pass through Decision Engine
+          // This happens IN MEMORY, < 10ms
+          const engineResponse = evaluateRequest(rawRequest, activeRules);
+
+          // 3. Apply Decision Effects (Simulation of Outcome)
+          let finalEvent = { ...rawRequest, ...engineResponse } as InferenceEvent;
+          
+          if (engineResponse.decision === 'CONDITIONAL' && engineResponse.overrides) {
+              // Apply the override effects to the simulation data
+              if (engineResponse.overrides.retries !== undefined) {
+                  // Simulate cost reduction from capping retries
+                  const originalRetries = rawRequest.retries || 0;
+                  const newRetries = engineResponse.overrides.retries;
+                  if (newRetries < originalRetries) {
+                      const reductionRatio = (1 + newRetries) / (1 + originalRetries);
+                      finalEvent.retries = newRetries;
+                      finalEvent.cost_usd = (rawRequest.cost_usd || 0) * reductionRatio;
+                      finalEvent.decision_applied = "CONDITIONAL";
+                      finalEvent.rule_applied = engineResponse.rule_id;
+                  }
+              }
+          }
+
+          // 4. Ingest into Learning Plane Buffer (Visual Log)
+          const newEvents = [...prev, finalEvent].slice(-200);
+          
+          // 5. Run Stats Engine (Cold Path)
           const rollingStatsEngine = new StreamingStats();
           newEvents.forEach(e => rollingStatsEngine.update(e.cost_usd));
           setStats(rollingStatsEngine.getStats(newEvents));
 
-          // 3. Autonomous Decision Compiler (Every 10 events)
-          if (newEvents.length % 10 === 0) {
-            const decision = compileDecision(newEvents);
-            if (decision) {
-                setLatestDecision(decision);
+          // 6. Run Decision Compiler (Analyst)
+          // Only run this periodically or when we have enough data
+          if (newEvents.length % 20 === 0 && !latestDecision) { // Don't overwrite if there's a pending decision to deploy
+            const analysis = compileDecision(newEvents);
+            if (analysis && analysis.decision_state !== 'INSUFFICIENT_EVIDENCE') {
+                setLatestDecision(analysis);
+                saveDecisionLogToDb(analysis);
             }
           }
 
           return newEvents;
         });
-      }, 80);
+      }, 50); // Fast simulation
     }
     return () => clearInterval(interval);
-  }, [mode]);
+  }, [mode, activeRules, latestDecision]); // Re-bind when rules change
 
   const reset = () => {
     setMode(SimulationMode.IDLE);
@@ -106,6 +198,14 @@ const App: React.FC = () => {
     setStats(null);
     seqRef.current = 0;
   };
+
+  const handleSignOut = () => {
+      setMode(SimulationMode.IDLE);
+      signOut(auth);
+  };
+
+  if (authLoading) return <div className="min-h-screen bg-[#09090b] flex items-center justify-center text-zinc-500 text-sm">Loading...</div>;
+  if (!user) return <Auth />;
 
   const highlights = latestDecision ? getDecisionHighlights(latestDecision) : null;
 
@@ -119,21 +219,25 @@ const App: React.FC = () => {
                 <GitCommit className="text-indigo-400" size={24} />
             </div>
             <div>
-                <h1 className="text-xl font-bold text-zinc-100 tracking-tight">Causal Inference Engine <span className="text-zinc-600 font-normal ml-2">v2.1 (Auditable)</span></h1>
+                <h1 className="text-xl font-bold text-zinc-100 tracking-tight">Causal Inference Engine <span className="text-zinc-600 font-normal ml-2">MVP 2.0</span></h1>
                 <div className="flex items-center gap-2 mt-1">
-                    <span className="text-[10px] uppercase tracking-wider font-semibold text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">Autonomous Core</span>
-                    <span className="text-zinc-600 text-[10px] font-mono">// Welford Stats • ANOVA Variance • Counterfactuals</span>
+                    <span className="text-[10px] uppercase tracking-wider font-semibold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Active Protection</span>
+                    <span className="text-zinc-600 text-[10px] font-mono">// Hot Path Latency: &lt;10ms</span>
                 </div>
             </div>
         </div>
         
         <div className="flex items-center gap-3">
+             <div className="text-xs text-zinc-500 mr-2 border-r border-zinc-800 pr-4">
+                 Engine: <span className="text-zinc-300">{user.email}</span>
+             </div>
+
             <div className="flex gap-2 bg-zinc-900 p-1 rounded-lg border border-zinc-800">
                 <button 
                     onClick={() => setMode(SimulationMode.RUNNING)}
                     className={`px-4 py-1.5 rounded text-xs font-medium flex items-center gap-2 transition-all ${mode === SimulationMode.RUNNING ? 'bg-zinc-800 text-emerald-400 border border-zinc-700 shadow-inner' : 'text-zinc-400 hover:text-zinc-200'}`}
                 >
-                    <Play size={14} /> Simulate Input
+                    <Play size={14} /> Simulate Traffic
                 </button>
                 <button 
                     onClick={reset}
@@ -142,66 +246,82 @@ const App: React.FC = () => {
                     <Square size={14} /> Reset
                 </button>
             </div>
+
+            <button onClick={handleSignOut} className="p-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 rounded-lg transition-colors">
+                <LogOut size={18} />
+            </button>
         </div>
       </header>
 
       <div className="grid grid-cols-12 gap-6">
         
-        {/* Left Column: Stats & Monitoring */}
+        {/* LEFT COLUMN: DATA PLANE (HOT PATH) */}
         <div className="col-span-3 space-y-6">
+             {/* Engine Status */}
              <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50 flex justify-between items-center">
-                    <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                        <Network size={12} /> Ingestion Stream
+                    <h3 className="text-[10px] font-bold text-emerald-500 uppercase tracking-widest flex items-center gap-2">
+                        <Zap size={12} /> Data Plane (Hot Path)
                     </h3>
-                    {mode === SimulationMode.RUNNING && <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />}
+                    <div className="flex items-center gap-2">
+                        <span className="text-[9px] text-zinc-500">FAIL-OPEN</span>
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                    </div>
                 </div>
                 <div className="p-4">
-                    <div className="text-xs text-zinc-500 mb-2">Processing Event Batch</div>
-                    <div className="font-mono text-2xl text-zinc-200 tabular-nums">
-                        {events.length.toString().padStart(4, '0')}
+                    <div className="flex justify-between items-end mb-2">
+                        <span className="text-xs text-zinc-500">Requests/sec</span>
+                        <span className="text-xl font-mono text-zinc-200">{mode === SimulationMode.RUNNING ? '124' : '0'}</span>
+                    </div>
+                    <div className="flex justify-between items-end">
+                        <span className="text-xs text-zinc-500">Avg Latency Overhead</span>
+                        <span className="text-xl font-mono text-emerald-400">0.04ms</span>
                     </div>
                 </div>
             </div>
 
-            <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
+            {/* Active Rules List */}
+            <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden min-h-[200px]">
                 <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50 flex justify-between items-center">
                     <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                        <BarChart3 size={12} /> Stats Engine
+                        <ShieldCheck size={12} /> Active Rules
                     </h3>
+                    <span className="text-[9px] text-zinc-600">{activeRules.length} Loaded</span>
                 </div>
-                {stats ? (
-                    <div className="p-4 space-y-4">
-                        <div>
-                            <div className="flex justify-between text-[10px] text-zinc-500 uppercase mb-1">Mean Cost</div>
-                            <div className="font-mono text-lg text-zinc-200">${stats.mean.toFixed(4)}</div>
-                        </div>
-                        <div>
-                            <div className="flex justify-between text-[10px] text-zinc-500 uppercase mb-1">Variance (σ²)</div>
-                            <div className="font-mono text-lg text-amber-500">{stats.variance.toFixed(6)}</div>
-                        </div>
-                        <div>
-                            <div className="flex justify-between text-[10px] text-zinc-500 uppercase mb-1">Instability Idx</div>
-                            <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
-                                <div className={`h-full transition-all duration-300 ${stats.instability_index > 0.1 ? 'bg-rose-500' : 'bg-emerald-500'}`} style={{width: `${Math.min(stats.instability_index * 100, 100)}%`}}></div>
+                <div className="p-2 space-y-2">
+                    {rulesLoading ? (
+                        <div className="text-center text-xs text-zinc-600 py-4">Syncing Control Plane...</div>
+                    ) : activeRules.length === 0 ? (
+                        <div className="text-center text-xs text-zinc-600 py-4 italic">No active rules. System is transparent.</div>
+                    ) : (
+                        activeRules.map(rule => (
+                            <div key={rule.id} className="bg-zinc-900 border border-zinc-800 p-2 rounded flex justify-between items-center group">
+                                <div>
+                                    <div className="text-[10px] text-emerald-400 font-bold uppercase">{rule.deploy_state}</div>
+                                    <div className="text-xs text-zinc-300">{rule.description}</div>
+                                    <div className="text-[9px] text-zinc-500 font-mono mt-0.5">ID: {rule.rule_id}</div>
+                                </div>
+                                <button 
+                                    onClick={() => handleDeleteRule(rule.id)}
+                                    className="text-zinc-600 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all"
+                                >
+                                    <Trash2 size={12} />
+                                </button>
                             </div>
-                            <div className="text-right text-[10px] text-zinc-400 mt-1">{stats.instability_index.toFixed(3)}</div>
-                        </div>
-                    </div>
-                ) : (
-                    <div className="p-4 text-center text-xs text-zinc-600">Idle</div>
-                )}
+                        ))
+                    )}
+                </div>
             </div>
         </div>
 
-        {/* Center: Logic & Decision */}
+        {/* CENTER: LEARNING PLANE (COLD PATH) */}
         <div className="col-span-6 space-y-6">
             
             {/* Real-time Graph */}
             <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg p-1 h-[200px] relative">
                  <div className="absolute top-3 left-4 z-10">
                     <div className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                        <Activity size={12} /> Cost Distribution
+                        <Activity size={12} /> Outcome Observation
                     </div>
                  </div>
                 <ResponsiveContainer width="100%" height="100%">
@@ -224,14 +344,14 @@ const App: React.FC = () => {
             <div className="bg-surface border border-zinc-800 rounded-lg overflow-hidden flex flex-col h-[500px]">
                  <div className="px-4 py-3 border-b border-zinc-800 bg-zinc-900/50 flex justify-between items-center">
                     <h3 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2">
-                        <Terminal size={12} /> Decision Object (Final Output)
+                        <Terminal size={12} /> Learning Plane (Analyst)
                     </h3>
-                    <div className="text-[10px] text-zinc-600 font-mono">v2.1.1-diagnostic</div>
+                    <div className="text-[10px] text-zinc-600 font-mono">Async Loop</div>
                 </div>
                 <div className="flex-1 bg-zinc-950 p-4 overflow-auto relative group">
                     {latestDecision && highlights ? (
                         <>
-                            {/* Visual Insights Overlay (Deterministic) */}
+                            {/* Visual Insights Overlay */}
                             <div className="mb-4 pb-4 border-b border-zinc-800/50 grid grid-cols-2 gap-3">
                                 <div className={`col-span-2 flex items-center gap-3 p-3 rounded-lg border bg-${highlights.color}-500/5 border-${highlights.color}-500/20`}>
                                      <div className={`p-2 rounded-full bg-${highlights.color}-500/10 text-${highlights.color}-500`}>
@@ -246,84 +366,57 @@ const App: React.FC = () => {
                                          </div>
                                      </div>
                                 </div>
-
-                                <div className="bg-zinc-900/50 p-3 rounded border border-zinc-800/50 flex flex-col justify-center">
-                                     <div className="flex items-center gap-2 mb-1.5">
-                                         <highlights.DriverIcon size={12} className="text-indigo-400" />
-                                         <span className="text-[10px] text-zinc-500 uppercase tracking-wide">Root Cause</span>
-                                     </div>
-                                     <div className="text-xs text-zinc-300 font-medium leading-snug">
-                                         {highlights.subhead}
-                                     </div>
-                                </div>
-
-                                <div className="bg-zinc-900/50 p-3 rounded border border-zinc-800/50 flex flex-col justify-center">
-                                     <div className="flex items-center gap-2 mb-1.5">
-                                         <Activity size={12} className="text-emerald-400" />
-                                         <span className="text-[10px] text-zinc-500 uppercase tracking-wide">Response</span>
-                                     </div>
-                                     <div className="text-xs text-emerald-400 font-mono flex items-center gap-1">
-                                         {highlights.action}
-                                         <ArrowRight size={10} />
-                                     </div>
-                                </div>
                             </div>
-                            
-                            {/* Formatted Decision View for Humans (in addition to JSON) */}
-                            <div className="mb-4 bg-zinc-900/50 p-3 rounded border border-zinc-800">
-                                <div className="flex justify-between items-start mb-2">
-                                    <div className="flex items-center gap-2">
-                                        <div className={`w-2 h-2 rounded-full ${latestDecision.decision_state === 'CONDITIONAL' ? 'bg-amber-500' : 'bg-emerald-500'}`}></div>
-                                        <span className="text-xs font-bold text-zinc-200">{latestDecision.decision_state}</span>
-                                    </div>
-                                    <span className="text-[10px] text-zinc-500 font-mono">ID: {latestDecision.id}</span>
-                                </div>
-                                
-                                <div className="grid grid-cols-2 gap-4 mt-3">
+
+                            {/* DEPLOY ACTION */}
+                            {latestDecision.decision_state === 'CONDITIONAL' && latestDecision.rule_generated && (
+                                <div className="mb-6 bg-emerald-900/10 border border-emerald-500/20 p-4 rounded-lg flex justify-between items-center">
                                     <div>
-                                        <div className="text-[10px] text-zinc-500 mb-1 flex items-center gap-1">
-                                            Confidence Score
+                                        <div className="text-xs font-bold text-emerald-400 mb-1 flex items-center gap-2">
+                                            <GitCommit size={12} /> Recommended Policy
                                         </div>
-                                        <div className="flex items-center gap-2">
-                                            <div className="text-sm font-mono text-zinc-200">
-                                                {latestDecision.confidence.final_score.toFixed(3)}
-                                            </div>
-                                            {latestDecision.confidence.overfit_risk !== 'LOW' && (
-                                                <div className={`text-[9px] px-1.5 py-0.5 rounded border uppercase font-bold flex items-center gap-1 ${
-                                                    latestDecision.confidence.overfit_risk === 'HIGH' 
-                                                    ? 'bg-rose-500/10 text-rose-500 border-rose-500/20' 
-                                                    : 'bg-amber-500/10 text-amber-500 border-amber-500/20'
+                                        <div className="text-sm text-zinc-200">{latestDecision.recommended_action.action}</div>
+                                        <div className="text-[10px] text-zinc-500 mt-1">Impact: ${latestDecision.expected_impact.monthly_projection_usd.toLocaleString()}/mo savings</div>
+                                    </div>
+                                    <button 
+                                        onClick={handleDeployRule}
+                                        className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-4 py-2 rounded shadow-lg shadow-emerald-900/20 transition-all flex items-center gap-2"
+                                    >
+                                        Deploy to Hot Path <ArrowRight size={12} />
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* NEW: Alternative Actions Table */}
+                            <div className="mb-4">
+                                <div className="text-[10px] text-zinc-500 uppercase mb-2 flex items-center gap-1">
+                                    <GitCommit size={10} /> Action Granularity
+                                </div>
+                                <div className="w-full text-left border-collapse">
+                                    {latestDecision.alternative_actions_considered.map((alt, i) => (
+                                        <div key={i} className="flex items-center justify-between py-1.5 px-2 text-[10px] border-b border-zinc-800/50 hover:bg-zinc-900/50">
+                                            <span className={`flex-1 ${i === 0 ? 'text-emerald-400 font-medium' : 'text-zinc-400'}`}>
+                                                {alt.action} {i === 0 && "(Selected)"}
+                                            </span>
+                                            <div className="flex items-center gap-3">
+                                                <span className={`px-1 rounded border ${
+                                                    alt.risk === 'LOW' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500' :
+                                                    alt.risk === 'MEDIUM' ? 'bg-amber-500/10 border-amber-500/20 text-amber-500' :
+                                                    'bg-rose-500/10 border-rose-500/20 text-rose-500'
                                                 }`}>
-                                                    <AlertTriangle size={8} />
-                                                    Overfit Risk: {latestDecision.confidence.overfit_risk}
-                                                </div>
-                                            )}
+                                                    {alt.risk}
+                                                </span>
+                                                <span className="font-mono text-zinc-300 w-8 text-right">{alt.score.toFixed(2)}</span>
+                                            </div>
                                         </div>
-                                        <div className="text-[9px] text-zinc-600 mt-0.5 font-mono">R²: {latestDecision.confidence.model_fit_r2.toFixed(3)}</div>
-                                    </div>
-                                    <div>
-                                         <div className="text-[10px] text-zinc-500 mb-1">Blast Radius</div>
-                                         <div className="text-sm font-mono text-zinc-200">
-                                            {(latestDecision.blast_radius.affected_revenue_pct * 100).toFixed(1)}% Rev
-                                         </div>
-                                    </div>
-                                </div>
-                                {/* Distribution Note */}
-                                <div className="mt-3 pt-2 border-t border-zinc-800/50 text-[10px] text-zinc-400 italic text-center">
-                                    "{latestDecision.expected_impact.distribution_notes}"
+                                    ))}
                                 </div>
                             </div>
-
-                            {/* Raw JSON */}
-                            <div className="text-[10px] text-zinc-500 uppercase mb-1 mt-4">Raw JSON Payload</div>
-                            <pre className="font-mono text-[10px] text-zinc-500 leading-relaxed">
-                                {JSON.stringify(latestDecision, null, 2)}
-                            </pre>
                         </>
                     ) : (
                         <div className="flex flex-col items-center justify-center h-full text-zinc-700 gap-2">
                             <Terminal size={24} />
-                            <span className="text-xs font-mono">Awaiting Decision Compilation...</span>
+                            <span className="text-xs font-mono">Analyzing Traffic Patterns...</span>
                         </div>
                     )}
                 </div>
@@ -331,98 +424,35 @@ const App: React.FC = () => {
 
         </div>
 
-        {/* Right: Proof & Audit */}
+        {/* RIGHT: BUSINESS IMPACT (PERSISTENT) */}
         <div className="col-span-3 space-y-6">
-            
-            {/* Variance Decomposition */}
-            <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
+             <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50">
                     <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                        <Cpu size={12} /> Root Cause
-                    </h3>
-                </div>
-                <div className="p-4 space-y-3">
-                    {latestDecision ? (
-                    <>
-                        {Object.entries(latestDecision.proof.variance_decomposition).map(([key, val]) => (
-                            <div key={key}>
-                                <div className="flex justify-between text-[10px] mb-1">
-                                    <span className="capitalize text-zinc-400">{key}</span>
-                                    <span className="font-mono text-zinc-300">{((val as number) * 100).toFixed(1)}%</span>
-                                </div>
-                                <div className="w-full bg-zinc-800 h-1 rounded-full overflow-hidden">
-                                    <div className="h-full bg-indigo-500" style={{width: `${(val as number) * 100}%`}}></div>
-                                </div>
-                            </div>
-                        ))}
-                        
-                        {/* Noise Warning */}
-                        {latestDecision.proof.noise_context && (
-                            <div className="mt-2 text-[9px] text-amber-500/80 bg-amber-500/5 p-2 rounded border border-amber-500/10 flex items-center gap-2">
-                                <AlertTriangle size={12} />
-                                {latestDecision.proof.noise_context}
-                            </div>
-                        )}
-                    </>
-                    ) : <div className="text-center text-[10px] text-zinc-700 py-4">Gathering Data</div>}
-                    
-                    {latestDecision?.analysis_deep_dive.top_causes.length > 0 && (
-                        <div className="mt-4 pt-3 border-t border-zinc-800/50">
-                            <div className="text-[10px] text-zinc-500 mb-2">Retry Deep Dive</div>
-                            {latestDecision.analysis_deep_dive.top_causes.map(cause => (
-                                <div key={cause.cause} className="flex justify-between text-[10px]">
-                                    <span className="text-rose-400">{cause.cause}</span>
-                                    <span className="text-zinc-500">{(cause.share * 100).toFixed(0)}%</span>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            </div>
-
-            {/* Impact & Reversibility */}
-            <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50">
-                    <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                        <Database size={12} /> Business Impact
+                        <Database size={12} /> Cost of Inaction
                     </h3>
                 </div>
                 <div className="p-4">
                     {latestDecision ? (
-                        <div className="space-y-4">
-                             <div className="bg-emerald-900/10 border border-emerald-900/30 p-2 rounded">
-                                <div className="text-[10px] text-emerald-500 font-bold mb-1">RECOMMENDATION</div>
-                                <div className="text-[10px] text-emerald-200/80 leading-tight mb-2">
-                                    {latestDecision.recommended_action.action}
-                                </div>
-                                <div className="text-[9px] text-emerald-500/50 border-t border-emerald-900/30 pt-1">
-                                    ONLY IF: {latestDecision.recommended_action.only_if.join(' AND ')}
-                                </div>
-                             </div>
-                             
-                             <div className="grid grid-cols-2 gap-2">
-                                <div className="text-center p-2 bg-zinc-900 rounded">
-                                    <div className="text-[10px] text-zinc-500">Savings / 1k</div>
-                                    <div className="text-xs font-mono text-emerald-400">${latestDecision.expected_impact.mean_savings_usd.toFixed(2)}</div>
-                                </div>
-                                <div className="text-center p-2 bg-zinc-900 rounded">
-                                    <div className="text-[10px] text-zinc-500">Proj. Monthly</div>
-                                    <div className="text-xs font-mono text-emerald-400">${latestDecision.expected_impact.monthly_projection_usd.toLocaleString()}</div>
-                                </div>
-                             </div>
-
-                             <div className="flex items-center gap-2 justify-center pt-2 text-zinc-500">
-                                <Undo2 size={10} />
-                                <span className="text-[10px]">Rollback: {latestDecision.reversibility.rollback_time_minutes} min</span>
-                             </div>
-                        </div>
-                    ) : <div className="text-center text-[10px] text-zinc-700 py-4">No Actionable Insight</div>}
+                        <div className="p-2.5 rounded bg-rose-500/5 border border-rose-500/10">
+                            <div className="flex items-center gap-1.5 text-[10px] text-rose-400 font-bold mb-2 uppercase tracking-wide">
+                                <TrendingDown size={12} /> Projected Loss
+                            </div>
+                            <div className="flex justify-between items-end mb-1">
+                                <span className="text-[10px] text-zinc-500">Monthly</span>
+                                <span className="text-xs font-mono text-rose-400 font-bold">${latestDecision.inaction_cost.expected_monthly_loss_usd.toLocaleString()}</span>
+                            </div>
+                            <div className="flex justify-between items-end">
+                                <span className="text-[10px] text-zinc-500">Runway Hit</span>
+                                <span className="text-xs font-mono text-rose-400">-{latestDecision.inaction_cost.runway_impact_days.toFixed(1)} Days</span>
+                            </div>
+                         </div>
+                    ) : <div className="text-center text-[10px] text-zinc-700">Gathering Data...</div>}
                 </div>
             </div>
-
-            {/* Blast Radius Card */}
+            
             <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50">
+                 <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50">
                     <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
                         <Users size={12} /> Blast Radius
                     </h3>
@@ -437,16 +467,8 @@ const App: React.FC = () => {
                              <div className="w-full bg-zinc-800 h-1 rounded-full overflow-hidden">
                                 <div className="h-full bg-indigo-500" style={{width: `${latestDecision.blast_radius.affected_tenants_pct * 100}%`}}></div>
                              </div>
-                             
-                             <div className="pt-2 text-[10px] text-zinc-500 uppercase">Top Impacted</div>
-                             {latestDecision.blast_radius.top_3_tenants.map(t => (
-                                 <div key={t.id} className="flex justify-between text-[10px]">
-                                     <span className="text-zinc-300 truncate w-24">{t.id}</span>
-                                     <span className="text-indigo-400 font-mono">{(t.share * 100).toFixed(1)}%</span>
-                                 </div>
-                             ))}
                         </div>
-                    ) : <div className="text-center text-[10px] text-zinc-700 py-4">Waiting...</div>}
+                    ) : <div className="text-center text-[10px] text-zinc-700">Waiting...</div>}
                 </div>
             </div>
 

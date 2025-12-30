@@ -16,6 +16,8 @@ const evaluateCondition = (event: InferenceEvent, condition: RuleCondition): boo
     case '==': return eventValue == val; // Loose equality for number/string mix
     case '>=': return eventValue >= val;
     case '<=': return eventValue <= val;
+    case 'in': // Simple inclusion check for strings/reasoning
+        return String(val).includes(String(eventValue));
     default: return false;
   }
 };
@@ -101,10 +103,26 @@ export const AVAILABLE_RULES: CounterfactualRule[] = [
         condition: { field: 'retries', op: '>', value: 1 },
         action: { field: 'retries', op: 'cap', value: 1 }
     },
+    // New granular rule: Only retry on timeouts (mocked implementation logic)
+    // In a real engine, 'condition' would be more complex (OR logic). 
+    // Here we simulate "If retry > 0 AND reason is NOT timeout, cap at 0".
+    {
+        id: 'retry_only_timeout',
+        description: 'Retry only on Timeout',
+        condition: { field: 'retry_reason', op: '!=', value: 'timeout' }, 
+        // This is a simplification: logic implies if it wasn't a timeout, we shouldn't have retried
+        action: { field: 'retries', op: 'cap', value: 0 } 
+    },
     {
         id: 'downgrade_reporting',
         description: 'Route "Reporting" to Haiku',
         condition: { field: 'prompt_class', op: '==', value: 'reporting' },
         action: { field: 'model', op: 'set', value: 'claude-3-haiku' }
+    },
+     {
+        id: 'downgrade_reporting_gpt35',
+        description: 'Route "Reporting" to GPT-3.5',
+        condition: { field: 'prompt_class', op: '==', value: 'reporting' },
+        action: { field: 'model', op: 'set', value: 'gpt-3.5-turbo' }
     }
 ];

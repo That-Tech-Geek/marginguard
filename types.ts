@@ -15,6 +15,30 @@ export interface InferenceEvent {
   retry_reason: string | null; // New: For Root Cause Analysis
   success: boolean;
   cost_usd: number;
+  // New: Engine Enrichment
+  decision_id?: string;
+  decision_applied?: "ALLOW" | "CONDITIONAL" | "BLOCK";
+  rule_applied?: string;
+}
+
+// --- REAL-TIME ENGINE TYPES (HOT PATH) ---
+
+export interface ActiveRule {
+  id: string;
+  rule_id: string; // e.g., 'cap_retries_1'
+  created_at: any; // Firestore Timestamp
+  deploy_state: "active" | "shadow" | "disabled";
+  condition: RuleCondition;
+  action: RuleAction;
+  description: string;
+  risk_score: number; // 0-1, used for blast radius checks
+}
+
+export interface EngineResponse {
+  decision: "ALLOW" | "CONDITIONAL" | "BLOCK";
+  overrides?: Record<string, any>;
+  rule_id?: string;
+  latency_overhead_ms: number;
 }
 
 // --- STATS ENGINE TYPES ---
@@ -104,6 +128,18 @@ export interface Reversibility {
   abort_threshold: number;
 }
 
+export interface AlternativeAction {
+  action: string;
+  score: number;
+  risk: "LOW" | "MEDIUM" | "HIGH";
+}
+
+export interface InactionCost {
+  expected_monthly_loss_usd: number;
+  tail_event_probability: number;
+  runway_impact_days: number;
+}
+
 export type DecisionState = "RECOMMENDED" | "CONDITIONAL" | "HOLD" | "INSUFFICIENT_EVIDENCE";
 
 export interface Proof {
@@ -125,11 +161,14 @@ export interface DecisionObject {
   timestamp: string;
   issue: string;
   decision_state: DecisionState;
+  decision_state_rationale: string[]; // NEW: Explains WHY it is Conditional/Hold
   root_cause: string;
   confidence: ConfidenceMetric; // Rich object
   recommended_action: Guardrail; // Rich object
+  alternative_actions_considered: AlternativeAction[]; // NEW: Granularity
   rule_generated: CounterfactualRule;
   expected_impact: ImpactPrediction; // Rich object
+  inaction_cost: InactionCost; // NEW: Regret Math
   risk: RiskAssessment;
   proof: Proof;
   // New Audit Fields
