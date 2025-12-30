@@ -40,3 +40,16 @@ export const fetchActiveRules = async (userId: string): Promise<ActiveRule[]> =>
 export const deleteRule = async (userId: string, ruleId: string): Promise<void> => {
     await deleteDoc(doc(db, 'users', userId, 'rules', ruleId));
 };
+
+export const logDecisionFeedback = async (userId: string, decisionId: string, type: 'SUCCESS' | 'OVERRIDE', reason?: string) => {
+    try {
+        await addDoc(collection(db, 'users', userId, 'decision_feedback'), {
+            decision_id: decisionId,
+            feedback_type: type,
+            override_reason: reason || null,
+            timestamp: serverTimestamp()
+        });
+    } catch (e) {
+        console.error("Failed to log feedback", e);
+    }
+};

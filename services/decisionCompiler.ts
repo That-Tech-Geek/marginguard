@@ -19,34 +19,37 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
   // 2. Decompose Variance to find Root Cause
   const varianceMap = decomposeVariance(events);
   
-  // 3. Heuristic: Find the highest variance driver
-  let driver = 'noise';
-  let maxContribution = 0;
-  for (const [key, val] of Object.entries(varianceMap)) {
-    if (val > maxContribution && key !== 'noise') {
-      maxContribution = val;
-      driver = key;
-    }
-  }
-  
-  const driverContribution = varianceMap[driver] || 0;
+  // 3. Robust Driver Selection
+  // Sort drivers by variance contribution (descending)
+  const sortedDrivers = Object.entries(varianceMap)
+      .filter(([key]) => key !== 'noise')
+      .sort((a, b) => b[1] - a[1]);
 
-  // 4. Select Rule based on Root Cause
+  if (sortedDrivers.length === 0) return null;
+
+  let driver = '';
+  let driverContribution = 0;
   let selectedRule = null;
   let alternativeRules = [];
-  
-  if (driver === 'retries') {
-    selectedRule = AVAILABLE_RULES.find(r => r.id === 'cap_retries_1');
-    alternativeRules = [
-        AVAILABLE_RULES.find(r => r.id === 'retry_only_timeout'),
-    ].filter(Boolean);
-  } else if (driver === 'prompt_class') {
-    selectedRule = AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting');
-    alternativeRules = [
-         AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting_gpt35'),
-    ].filter(Boolean);
+
+  // Iterate through drivers to find the first one that is Actionable (has rules)
+  for (const [key, val] of sortedDrivers) {
+      if (key === 'retries') {
+          selectedRule = AVAILABLE_RULES.find(r => r.id === 'cap_retries_1');
+          alternativeRules = [AVAILABLE_RULES.find(r => r.id === 'retry_only_timeout')].filter(Boolean);
+      } else if (key === 'prompt_class') {
+          selectedRule = AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting');
+          alternativeRules = [AVAILABLE_RULES.find(r => r.id === 'downgrade_reporting_gpt35')].filter(Boolean);
+      }
+      
+      if (selectedRule) {
+          driver = key;
+          driverContribution = val;
+          break; // Found our primary actionable driver
+      }
   }
 
+  // If no actionable driver found (e.g. only 'model' variance but no model rules), return null
   if (!selectedRule) return null;
 
   // 5. Run Counterfactual Simulation (Primary Rule)
@@ -121,7 +124,7 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
 
   // 7c. Noise Context (Fix for "Zero Noise is fake")
   const noiseVal = varianceMap['noise'] || 0;
-  let noiseContext = undefined;
+  let noiseContext: string | null = null;
   if (noiseVal < 0.02) {
       noiseContext = "Deterministic constraint detected (Noise < 2%).";
   }

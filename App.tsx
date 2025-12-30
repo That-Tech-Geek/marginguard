@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight, Check, AlertOctagon, TrendingDown, LogOut, ShieldCheck, Zap, Trash2 } from 'lucide-react';
+import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight, Check, AlertOctagon, TrendingDown, LogOut, ShieldCheck, Zap, Trash2, XCircle, MessageSquare } from 'lucide-react';
 import { AreaChart, Area, CartesianGrid, Tooltip, ResponsiveContainer, YAxis } from 'recharts';
 import { InferenceEvent, DecisionObject, SimulationMode, DistributionStats, ActiveRule } from './types';
 import { StreamingStats } from './services/statsEngine';
@@ -11,7 +11,7 @@ import { evaluateRequest } from './services/decisionEngine';
 import { auth, db } from './services/firebase';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
-import { fetchActiveRules, deployRule, deleteRule } from './services/rulesService';
+import { fetchActiveRules, deployRule, deleteRule, logDecisionFeedback } from './services/rulesService';
 import Auth from './components/Auth';
 
 // --- SIMULATION LAYER (INPUT DATA ONLY) ---
@@ -24,18 +24,25 @@ const generateRawRequest = (seq: number): Partial<InferenceEvent> => {
   const pClass = PROMPT_CLASSES[Math.floor(Math.random() * PROMPT_CLASSES.length)];
   let retries = 0;
   let retryReason = null;
+  let model = MODELS[Math.floor(Math.random() * MODELS.length)];
   
-  // Inject the "Fault": Reporting has high retry rate due to timeouts
-  if (pClass === 'reporting' && Math.random() > 0.65) {
-    retries = Math.floor(Math.random() * 3) + 1;
-    retryReason = Math.random() > 0.2 ? 'timeout' : 'upstream_503';
-  } else if (Math.random() > 0.95) {
+  // Inject correlations to make statistical analysis robust:
+  // 1. "Reporting" class is heavy, uses GPT-4 often, and fails often.
+  if (pClass === 'reporting') {
+      if (Math.random() > 0.3) model = 'gpt-4'; // High correlation with expensive model
+      
+      // The Fault:
+      if (Math.random() > 0.65) {
+        retries = Math.floor(Math.random() * 3) + 1;
+        retryReason = Math.random() > 0.2 ? 'timeout' : 'upstream_503';
+      }
+  } else if (Math.random() > 0.98) {
+      // Background noise failures
       retries = 1;
       retryReason = RETRY_REASONS[Math.floor(Math.random() * RETRY_REASONS.length)];
   }
 
   const baseTokens = 500 + Math.random() * 1500;
-  const model = MODELS[Math.floor(Math.random() * MODELS.length)];
   const tenant = Math.random() > 0.6 ? 'acme_corp' : TENANTS[Math.floor(Math.random() * TENANTS.length)];
 
   return {
@@ -53,7 +60,7 @@ const generateRawRequest = (seq: number): Partial<InferenceEvent> => {
     retry_reason: retryReason,
     success: true,
     // Base cost before any intervention
-    cost_usd: ((baseTokens * (1 + retries)) / 1000) * (model === 'gpt-4' ? 0.03 : 0.002)
+    cost_usd: ((baseTokens * (1 + retries)) / 1000) * (model.includes('gpt-4') || model.includes('opus') ? 0.03 : 0.002)
   };
 };
 
@@ -64,11 +71,18 @@ const App: React.FC = () => {
 
   const [mode, setMode] = useState<SimulationMode>(SimulationMode.IDLE);
   const [events, setEvents] = useState<InferenceEvent[]>([]);
+  // We use a Ref for the Analysis loop to access data without dependency cycles or re-renders
+  const eventsRef = useRef<InferenceEvent[]>([]);
+
   const [currentQPS, setCurrentQPS] = useState(0);
   
   // Learning Plane State
   const [latestDecision, setLatestDecision] = useState<DecisionObject | null>(null);
   const [stats, setStats] = useState<DistributionStats | null>(null);
+  
+  // Interaction State
+  const [showOverrideInput, setShowOverrideInput] = useState(false);
+  const [overrideReason, setOverrideReason] = useState("");
   
   // Data Plane State (Rules)
   const [activeRules, setActiveRules] = useState<ActiveRule[]>([]);
@@ -102,12 +116,34 @@ const App: React.FC = () => {
   const handleDeployRule = async () => {
       if (!latestDecision || !latestDecision.rule_generated || !user) return;
       try {
+          // 1. Deploy Rule
           const newRule = await deployRule(user.uid, latestDecision.rule_generated);
           setActiveRules(prev => [...prev, newRule]);
-          // Reset decision to look for next insight
+          
+          // 2. Log Success Feedback
+          await logDecisionFeedback(user.uid, latestDecision.id, 'SUCCESS');
+
+          // 3. Reset UI
           setLatestDecision(null);
+          setShowOverrideInput(false);
       } catch (e) {
           console.error("Deploy failed", e);
+      }
+  };
+
+  const handleOverrideClick = () => {
+      setShowOverrideInput(true);
+  };
+
+  const submitOverride = async () => {
+      if (!latestDecision || !user) return;
+      try {
+          await logDecisionFeedback(user.uid, latestDecision.id, 'OVERRIDE', overrideReason);
+          setLatestDecision(null);
+          setShowOverrideInput(false);
+          setOverrideReason("");
+      } catch (e) {
+          console.error("Override log failed", e);
       }
   };
 
@@ -121,33 +157,17 @@ const App: React.FC = () => {
       }
   };
 
-  // Save decision log (Cold Path)
-  const saveDecisionLogToDb = async (decision: DecisionObject) => {
-    if (!userRef.current) return;
-    try {
-        await addDoc(collection(db, 'users', userRef.current.uid, 'analysis_logs'), {
-            ...decision,
-            savedAt: serverTimestamp()
-        });
-    } catch (e) {
-        console.error("Failed to save analysis log", e);
-    }
-  };
-
+  // --- TRAFFIC SIMULATION LOOP (50ms) ---
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
     if (mode === SimulationMode.RUNNING) {
       interval = setInterval(() => {
         setEvents(prev => {
-          // --- TRAFFIC SIMULATOR (HIGH THROUGHPUT) ---
-          // Goal: ~700-800 QPS
-          // Interval: 50ms (20 ticks/sec)
-          // Target Batch: ~35-45 requests per tick
-          
+          // Goal: ~1000 QPS -> ~50 requests per 50ms tick
           const time = Date.now() / 1000;
-          const variance = Math.sin(time) * 100; // Oscillate traffic
-          const targetQPS = 750 + variance + (Math.random() * 50);
-          const batchSize = Math.floor(targetQPS / 20); // /20 because 50ms interval
+          const variance = Math.sin(time) * 150; 
+          const targetQPS = 1000 + variance + (Math.random() * 50);
+          const batchSize = Math.floor(targetQPS / 20); 
           
           setCurrentQPS(Math.round(targetQPS));
 
@@ -155,14 +175,9 @@ const App: React.FC = () => {
 
           for (let i = 0; i < batchSize; i++) {
               seqRef.current += 1;
-              
-              // 1. Generate Raw Request
               const rawRequest = generateRawRequest(seqRef.current);
-              
-              // 2. HOT PATH: Decision Engine (In-Memory, <10ms)
               const engineResponse = evaluateRequest(rawRequest, activeRules);
               
-              // 3. Apply Effects (Simulation)
               let finalEvent = { ...rawRequest, ...engineResponse } as InferenceEvent;
 
               if (engineResponse.decision === 'CONDITIONAL' && engineResponse.overrides) {
@@ -181,40 +196,61 @@ const App: React.FC = () => {
               newBatch.push(finalEvent);
           }
 
-          // 4. Update State (Rolling Window for UI)
-          // We only keep the last 200 for the graph to remain performant, 
-          // even though we processed much more data.
-          const combinedEvents = [...prev, ...newBatch].slice(-200);
+          // Keep 2000 for graph visual history
+          const combinedEvents = [...prev, ...newBatch].slice(-2000);
           
-          // 5. Run Stats Engine (Cold Path) - Process the entire new batch
+          // Update Ref for the separate analysis loop
+          eventsRef.current = combinedEvents;
+
+          // Compute Stats for Data Plane Display (Fast, lightweight)
           const rollingStatsEngine = new StreamingStats();
-          // We recalculate stats based on the visual window to match the graph
           combinedEvents.forEach(e => rollingStatsEngine.update(e.cost_usd));
           setStats(rollingStatsEngine.getStats(combinedEvents));
 
-          // 6. Run Decision Compiler (Analyst)
-          // Run probabilistically to simulate async worker (approx once every 2 seconds)
-          if (Math.random() > 0.98 && !latestDecision) {
-            const analysis = compileDecision(combinedEvents);
-            if (analysis && analysis.decision_state !== 'INSUFFICIENT_EVIDENCE') {
-                setLatestDecision(analysis);
-                saveDecisionLogToDb(analysis);
-            }
-          }
-
           return combinedEvents;
         });
-      }, 50); // 50ms tick
+      }, 50);
     } else {
         setCurrentQPS(0);
     }
     return () => clearInterval(interval);
-  }, [mode, activeRules, latestDecision]); // Re-bind when rules change
+  }, [mode, activeRules]); 
+
+
+  // --- ANALYSIS LOOP (2Hz / 500ms) ---
+  useEffect(() => {
+      if (mode !== SimulationMode.RUNNING) return;
+
+      const analysisInterval = setInterval(() => {
+          // Guard: If user is interacting (Override mode), pause analysis updates to prevent UI jumping
+          if (showOverrideInput) return;
+
+          const currentEvents = eventsRef.current;
+          if (currentEvents.length < 50) return;
+
+          // Rolling basis: Last 1000 queries
+          const analysisWindow = currentEvents.slice(-1000);
+
+          const analysis = compileDecision(analysisWindow);
+          
+          if (analysis && analysis.decision_state !== 'INSUFFICIENT_EVIDENCE') {
+              setLatestDecision(analysis);
+              // Note: We are NOT auto-saving to DB here to prevent spamming 2 writes/sec.
+              // Saving happens on 'Deploy' or 'Override' action, which acts as the "Commit".
+          }
+
+      }, 500); // 2 times per second
+
+      return () => clearInterval(analysisInterval);
+  }, [mode, showOverrideInput]);
+
 
   const reset = () => {
     setMode(SimulationMode.IDLE);
     setEvents([]);
+    eventsRef.current = [];
     setLatestDecision(null);
+    setShowOverrideInput(false);
     setStats(null);
     setCurrentQPS(0);
     seqRef.current = 0;
@@ -289,17 +325,30 @@ const App: React.FC = () => {
                         <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
                     </div>
                 </div>
-                <div className="p-4">
-                    <div className="flex justify-between items-end mb-2">
+                <div className="p-4 space-y-3">
+                    <div className="flex justify-between items-end">
                         <span className="text-xs text-zinc-500">Requests/sec</span>
                         <div className="flex items-baseline gap-1">
                             <span className="text-xl font-mono text-zinc-200">{currentQPS}</span>
                             <span className="text-[10px] text-zinc-500">QPS</span>
                         </div>
                     </div>
-                    <div className="flex justify-between items-end">
-                        <span className="text-xs text-zinc-500">Avg Latency Overhead</span>
-                        <span className="text-xl font-mono text-emerald-400">0.04ms</span>
+                    {/* Live Stats Display */}
+                    {stats && (
+                        <>
+                            <div className="flex justify-between items-end border-t border-zinc-800/50 pt-2">
+                                <span className="text-xs text-zinc-500">Avg Cost</span>
+                                <span className="text-sm font-mono text-zinc-300">${stats.mean.toFixed(4)}</span>
+                            </div>
+                            <div className="flex justify-between items-end">
+                                <span className="text-xs text-zinc-500">P99 Cost</span>
+                                <span className="text-sm font-mono text-rose-400">${stats.p99.toFixed(4)}</span>
+                            </div>
+                        </>
+                    )}
+                    <div className="flex justify-between items-end border-t border-zinc-800/50 pt-2">
+                        <span className="text-xs text-zinc-500">Latency Added</span>
+                        <span className="text-sm font-mono text-emerald-400">0.04ms</span>
                     </div>
                 </div>
             </div>
@@ -370,7 +419,12 @@ const App: React.FC = () => {
                     <h3 className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center gap-2">
                         <Terminal size={12} /> Learning Plane (Analyst)
                     </h3>
-                    <div className="text-[10px] text-zinc-600 font-mono">Async Loop</div>
+                    <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-1.5">
+                            <span className={`w-1.5 h-1.5 rounded-full ${mode === SimulationMode.RUNNING ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-600'}`}></span>
+                            <span className="text-[10px] text-zinc-500 font-mono">Loop: 2Hz</span>
+                        </div>
+                    </div>
                 </div>
                 <div className="flex-1 bg-zinc-950 p-4 overflow-auto relative group">
                     {latestDecision && highlights ? (
@@ -392,26 +446,66 @@ const App: React.FC = () => {
                                 </div>
                             </div>
 
-                            {/* DEPLOY ACTION */}
+                            {/* ACTIONS: DEPLOY vs OVERRIDE */}
                             {latestDecision.decision_state === 'CONDITIONAL' && latestDecision.rule_generated && (
-                                <div className="mb-6 bg-emerald-900/10 border border-emerald-500/20 p-4 rounded-lg flex justify-between items-center">
-                                    <div>
-                                        <div className="text-xs font-bold text-emerald-400 mb-1 flex items-center gap-2">
-                                            <GitCommit size={12} /> Recommended Policy
+                                <div className="mb-6 bg-emerald-900/10 border border-emerald-500/20 p-4 rounded-lg">
+                                    <div className="flex justify-between items-start mb-4">
+                                        <div>
+                                            <div className="text-xs font-bold text-emerald-400 mb-1 flex items-center gap-2">
+                                                <GitCommit size={12} /> Recommended Policy
+                                            </div>
+                                            <div className="text-sm text-zinc-200">{latestDecision.recommended_action.action}</div>
+                                            <div className="text-[10px] text-zinc-500 mt-1">Impact: ${latestDecision.expected_impact.monthly_projection_usd.toLocaleString()}/mo savings</div>
                                         </div>
-                                        <div className="text-sm text-zinc-200">{latestDecision.recommended_action.action}</div>
-                                        <div className="text-[10px] text-zinc-500 mt-1">Impact: ${latestDecision.expected_impact.monthly_projection_usd.toLocaleString()}/mo savings</div>
                                     </div>
-                                    <button 
-                                        onClick={handleDeployRule}
-                                        className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-4 py-2 rounded shadow-lg shadow-emerald-900/20 transition-all flex items-center gap-2"
-                                    >
-                                        Deploy to Hot Path <ArrowRight size={12} />
-                                    </button>
+                                    
+                                    {!showOverrideInput ? (
+                                        <div className="flex items-center gap-2">
+                                            <button 
+                                                onClick={handleDeployRule}
+                                                className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-4 py-2 rounded shadow-lg shadow-emerald-900/20 transition-all flex items-center justify-center gap-2"
+                                            >
+                                                Deploy to Hot Path <ArrowRight size={12} />
+                                            </button>
+                                            <button 
+                                                onClick={handleOverrideClick}
+                                                className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-bold rounded border border-zinc-700 transition-all flex items-center gap-2"
+                                            >
+                                                <XCircle size={14} /> Override
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="bg-zinc-900 p-3 rounded border border-zinc-700/50 mt-2 animate-in fade-in slide-in-from-top-2 duration-200">
+                                            <div className="flex items-center gap-2 mb-2 text-xs text-zinc-400">
+                                                <MessageSquare size={12} />
+                                                <span>Reason for Override / Rejection:</span>
+                                            </div>
+                                            <textarea 
+                                                value={overrideReason}
+                                                onChange={(e) => setOverrideReason(e.target.value)}
+                                                placeholder="e.g., False positive, business critical workflow..."
+                                                className="w-full bg-zinc-950 border border-zinc-800 rounded p-2 text-xs text-zinc-200 focus:outline-none focus:border-amber-500/50 mb-3 min-h-[60px]"
+                                            />
+                                            <div className="flex justify-end gap-2">
+                                                <button 
+                                                    onClick={() => { setShowOverrideInput(false); setOverrideReason(""); }}
+                                                    className="px-3 py-1.5 text-xs text-zinc-500 hover:text-zinc-300"
+                                                >
+                                                    Cancel
+                                                </button>
+                                                <button 
+                                                    onClick={submitOverride}
+                                                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded shadow-lg transition-all"
+                                                >
+                                                    Submit Override
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
-                            {/* NEW: Alternative Actions Table */}
+                            {/* Alternative Actions Table */}
                             <div className="mb-4">
                                 <div className="text-[10px] text-zinc-500 uppercase mb-2 flex items-center gap-1">
                                     <GitCommit size={10} /> Action Granularity

@@ -144,7 +144,7 @@ export type DecisionState = "RECOMMENDED" | "CONDITIONAL" | "HOLD" | "INSUFFICIE
 
 export interface Proof {
   variance_decomposition: VarianceDecomposition;
-  noise_context?: string; // New: Explains suspicious lack of noise
+  noise_context?: string | null; // New: Explains suspicious lack of noise
   counterfactual_comparison: {
     baseline_cost: number;
     simulated_cost: number;
