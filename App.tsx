@@ -64,6 +64,7 @@ const App: React.FC = () => {
 
   const [mode, setMode] = useState<SimulationMode>(SimulationMode.IDLE);
   const [events, setEvents] = useState<InferenceEvent[]>([]);
+  const [currentQPS, setCurrentQPS] = useState(0);
   
   // Learning Plane State
   const [latestDecision, setLatestDecision] = useState<DecisionObject | null>(null);
@@ -138,55 +139,74 @@ const App: React.FC = () => {
     if (mode === SimulationMode.RUNNING) {
       interval = setInterval(() => {
         setEvents(prev => {
-          seqRef.current += 1;
+          // --- TRAFFIC SIMULATOR (HIGH THROUGHPUT) ---
+          // Goal: ~700-800 QPS
+          // Interval: 50ms (20 ticks/sec)
+          // Target Batch: ~35-45 requests per tick
           
-          // 1. Generate Raw Traffic
-          const rawRequest = generateRawRequest(seqRef.current);
+          const time = Date.now() / 1000;
+          const variance = Math.sin(time) * 100; // Oscillate traffic
+          const targetQPS = 750 + variance + (Math.random() * 50);
+          const batchSize = Math.floor(targetQPS / 20); // /20 because 50ms interval
           
-          // 2. HOT PATH: Pass through Decision Engine
-          // This happens IN MEMORY, < 10ms
-          const engineResponse = evaluateRequest(rawRequest, activeRules);
+          setCurrentQPS(Math.round(targetQPS));
 
-          // 3. Apply Decision Effects (Simulation of Outcome)
-          let finalEvent = { ...rawRequest, ...engineResponse } as InferenceEvent;
-          
-          if (engineResponse.decision === 'CONDITIONAL' && engineResponse.overrides) {
-              // Apply the override effects to the simulation data
-              if (engineResponse.overrides.retries !== undefined) {
-                  // Simulate cost reduction from capping retries
-                  const originalRetries = rawRequest.retries || 0;
-                  const newRetries = engineResponse.overrides.retries;
-                  if (newRetries < originalRetries) {
-                      const reductionRatio = (1 + newRetries) / (1 + originalRetries);
-                      finalEvent.retries = newRetries;
-                      finalEvent.cost_usd = (rawRequest.cost_usd || 0) * reductionRatio;
-                      finalEvent.decision_applied = "CONDITIONAL";
-                      finalEvent.rule_applied = engineResponse.rule_id;
+          const newBatch: InferenceEvent[] = [];
+
+          for (let i = 0; i < batchSize; i++) {
+              seqRef.current += 1;
+              
+              // 1. Generate Raw Request
+              const rawRequest = generateRawRequest(seqRef.current);
+              
+              // 2. HOT PATH: Decision Engine (In-Memory, <10ms)
+              const engineResponse = evaluateRequest(rawRequest, activeRules);
+              
+              // 3. Apply Effects (Simulation)
+              let finalEvent = { ...rawRequest, ...engineResponse } as InferenceEvent;
+
+              if (engineResponse.decision === 'CONDITIONAL' && engineResponse.overrides) {
+                  if (engineResponse.overrides.retries !== undefined) {
+                      const originalRetries = rawRequest.retries || 0;
+                      const newRetries = engineResponse.overrides.retries;
+                      if (newRetries < originalRetries) {
+                          const reductionRatio = (1 + newRetries) / (1 + originalRetries);
+                          finalEvent.retries = newRetries;
+                          finalEvent.cost_usd = (rawRequest.cost_usd || 0) * reductionRatio;
+                          finalEvent.decision_applied = "CONDITIONAL";
+                          finalEvent.rule_applied = engineResponse.rule_id;
+                      }
                   }
               }
+              newBatch.push(finalEvent);
           }
 
-          // 4. Ingest into Learning Plane Buffer (Visual Log)
-          const newEvents = [...prev, finalEvent].slice(-200);
+          // 4. Update State (Rolling Window for UI)
+          // We only keep the last 200 for the graph to remain performant, 
+          // even though we processed much more data.
+          const combinedEvents = [...prev, ...newBatch].slice(-200);
           
-          // 5. Run Stats Engine (Cold Path)
+          // 5. Run Stats Engine (Cold Path) - Process the entire new batch
           const rollingStatsEngine = new StreamingStats();
-          newEvents.forEach(e => rollingStatsEngine.update(e.cost_usd));
-          setStats(rollingStatsEngine.getStats(newEvents));
+          // We recalculate stats based on the visual window to match the graph
+          combinedEvents.forEach(e => rollingStatsEngine.update(e.cost_usd));
+          setStats(rollingStatsEngine.getStats(combinedEvents));
 
           // 6. Run Decision Compiler (Analyst)
-          // Only run this periodically or when we have enough data
-          if (newEvents.length % 20 === 0 && !latestDecision) { // Don't overwrite if there's a pending decision to deploy
-            const analysis = compileDecision(newEvents);
+          // Run probabilistically to simulate async worker (approx once every 2 seconds)
+          if (Math.random() > 0.98 && !latestDecision) {
+            const analysis = compileDecision(combinedEvents);
             if (analysis && analysis.decision_state !== 'INSUFFICIENT_EVIDENCE') {
                 setLatestDecision(analysis);
                 saveDecisionLogToDb(analysis);
             }
           }
 
-          return newEvents;
+          return combinedEvents;
         });
-      }, 50); // Fast simulation
+      }, 50); // 50ms tick
+    } else {
+        setCurrentQPS(0);
     }
     return () => clearInterval(interval);
   }, [mode, activeRules, latestDecision]); // Re-bind when rules change
@@ -196,6 +216,7 @@ const App: React.FC = () => {
     setEvents([]);
     setLatestDecision(null);
     setStats(null);
+    setCurrentQPS(0);
     seqRef.current = 0;
   };
 
@@ -271,7 +292,10 @@ const App: React.FC = () => {
                 <div className="p-4">
                     <div className="flex justify-between items-end mb-2">
                         <span className="text-xs text-zinc-500">Requests/sec</span>
-                        <span className="text-xl font-mono text-zinc-200">{mode === SimulationMode.RUNNING ? '124' : '0'}</span>
+                        <div className="flex items-baseline gap-1">
+                            <span className="text-xl font-mono text-zinc-200">{currentQPS}</span>
+                            <span className="text-[10px] text-zinc-500">QPS</span>
+                        </div>
                     </div>
                     <div className="flex justify-between items-end">
                         <span className="text-xs text-zinc-500">Avg Latency Overhead</span>
