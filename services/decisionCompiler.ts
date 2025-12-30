@@ -141,12 +141,28 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
   }
   const blastRadius = analyzeBlastRadius(events, problematicEvents);
 
-  // 9. Guardrails & Reversibility
+  // 9. Guardrails & Reversibility Calculation
   let guardrails: string[] = [];
+  let reversibility = {
+      rollback_time_minutes: 2,
+      monitor_metric: "p99_latency",
+      abort_threshold: 2000
+  };
+
   if (driver === 'retries') {
       guardrails = ["error_type != provider_5xx", "success_rate >= 99.2%"];
+      reversibility = {
+          rollback_time_minutes: 0.1, // Configuration change is instant
+          monitor_metric: "error_rate_5xx",
+          abort_threshold: 0.05 // 5% error rate triggers abort
+      };
   } else {
       guardrails = ["latency_p99 < 2000ms", "user_segment != 'enterprise'"];
+      reversibility = {
+          rollback_time_minutes: 1.5,
+          monitor_metric: "p99_latency",
+          abort_threshold: 1200 // Stricter latency requirement for model downgrade
+      };
   }
 
   // 10. Decision State & Rationale
@@ -243,11 +259,6 @@ export const compileDecision = (events: InferenceEvent[]): DecisionObject | null
 
     analysis_deep_dive: retryAnalysis,
     blast_radius: blastRadius,
-    
-    reversibility: {
-        rollback_time_minutes: 2,
-        monitor_metric: "p99_latency",
-        abort_threshold: 2000
-    }
+    reversibility: reversibility
   };
 };

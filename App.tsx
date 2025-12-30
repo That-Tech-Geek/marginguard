@@ -644,6 +644,38 @@ const App: React.FC = () => {
                 </div>
             </div>
 
+            <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-lg overflow-hidden">
+                <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/50">
+                    <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
+                        <Undo2 size={12} /> Reversibility & Safety
+                    </h3>
+                </div>
+                <div className="p-4">
+                    {latestDecision ? (
+                        <div className="space-y-4">
+                                <div className="flex items-start gap-3">
+                                    <div className="p-1.5 bg-emerald-500/10 rounded text-emerald-500 mt-0.5">
+                                        <ShieldCheck size={14} />
+                                    </div>
+                                    <div>
+                                        <div className="text-[10px] text-zinc-400 font-bold uppercase tracking-wide mb-0.5">Circuit Breaker</div>
+                                        <div className="text-xs text-zinc-300 leading-relaxed">
+                                            Auto-rollback if <span className="text-emerald-400 font-mono">{latestDecision.reversibility.monitor_metric}</span> exceeds <span className="text-rose-400 font-mono">{latestDecision.reversibility.abort_threshold}</span>.
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="w-full h-px bg-zinc-800/50"></div>
+
+                                <div className="flex justify-between items-center">
+                                    <span className="text-[10px] text-zinc-500">Mean Time to Recover (MTTR)</span>
+                                    <span className="text-xs font-mono text-zinc-200">{latestDecision.reversibility.rollback_time_minutes}m</span>
+                                </div>
+                        </div>
+                    ) : <div className="text-center text-[10px] text-zinc-700">Waiting...</div>}
+                </div>
+            </div>
+
         </div>
 
       </div>
