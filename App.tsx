@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight, Check, AlertOctagon, TrendingDown, LogOut, ShieldCheck, Zap, Trash2, XCircle, MessageSquare } from 'lucide-react';
+import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight, Check, AlertOctagon, TrendingDown, LogOut, ShieldCheck, Zap, Trash2, XCircle, MessageSquare, Layers } from 'lucide-react';
 import { AreaChart, Area, CartesianGrid, Tooltip, ResponsiveContainer, YAxis } from 'recharts';
 import { InferenceEvent, DecisionObject, SimulationMode, DistributionStats, ActiveRule } from './types';
 import { StreamingStats } from './services/statsEngine';
@@ -181,13 +181,37 @@ const App: React.FC = () => {
               let finalEvent = { ...rawRequest, ...engineResponse } as InferenceEvent;
 
               if (engineResponse.decision === 'CONDITIONAL' && engineResponse.overrides) {
+                  // Handle Retries Override
                   if (engineResponse.overrides.retries !== undefined) {
                       const originalRetries = rawRequest.retries || 0;
                       const newRetries = engineResponse.overrides.retries;
                       if (newRetries < originalRetries) {
                           const reductionRatio = (1 + newRetries) / (1 + originalRetries);
                           finalEvent.retries = newRetries;
-                          finalEvent.cost_usd = (rawRequest.cost_usd || 0) * reductionRatio;
+                          finalEvent.cost_usd = (finalEvent.cost_usd || 0) * reductionRatio;
+                          finalEvent.decision_applied = "CONDITIONAL";
+                          finalEvent.rule_applied = engineResponse.rule_id;
+                      }
+                  }
+                  
+                  // Handle Model Override (e.g., Downgrade High Cost Models)
+                  if (engineResponse.overrides.model !== undefined) {
+                      const oldModel = rawRequest.model || '';
+                      const newModel = engineResponse.overrides.model;
+                      
+                      if (oldModel !== newModel) {
+                          finalEvent.model = newModel;
+                          
+                          // Recalculate cost based on approximate model tier difference
+                          const getRate = (m: string) => (m.includes('gpt-4') || m.includes('opus') ? 0.03 : 0.002);
+                          const oldRate = getRate(oldModel);
+                          const newRate = getRate(newModel);
+                          
+                          if (oldRate > 0) {
+                              const ratio = newRate / oldRate;
+                              finalEvent.cost_usd = (finalEvent.cost_usd || 0) * ratio;
+                          }
+                          
                           finalEvent.decision_applied = "CONDITIONAL";
                           finalEvent.rule_applied = engineResponse.rule_id;
                       }
@@ -443,6 +467,36 @@ const App: React.FC = () => {
                                              {highlights.headline}
                                          </div>
                                      </div>
+                                </div>
+                            </div>
+
+                            {/* Variance Drivers Analysis - NEW SECTION */}
+                            <div className="mb-6 p-3 bg-zinc-900/50 rounded border border-zinc-800/50">
+                                <div className="text-[10px] text-zinc-500 uppercase mb-3 flex items-center gap-1">
+                                    <Layers size={10} /> Variance Drivers
+                                </div>
+                                <div className="space-y-3">
+                                    {Object.entries(latestDecision.proof.variance_decomposition)
+                                        .sort(([, a], [, b]) => (b as number) - (a as number))
+                                        .map(([key, value]) => (
+                                        <div key={key} className="space-y-1">
+                                            <div className="flex justify-between text-[10px]">
+                                                <span className="capitalize text-zinc-300">{key.replace('_', ' ')}</span>
+                                                <span className="font-mono text-zinc-400">{((value as number) * 100).toFixed(1)}%</span>
+                                            </div>
+                                            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                                                <div 
+                                                    className={`h-full rounded-full ${
+                                                        key === 'noise' ? 'bg-zinc-600' :
+                                                        key === 'retries' ? 'bg-amber-500' :
+                                                        key === 'prompt_class' ? 'bg-emerald-500' :
+                                                        'bg-indigo-500'
+                                                    }`}
+                                                    style={{ width: `${(value as number) * 100}%` }}
+                                                />
+                                            </div>
+                                        </div>
+                                    ))}
                                 </div>
                             </div>
 
