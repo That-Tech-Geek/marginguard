@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, Bot, BarChart3, Database, ShieldAlert, Users, Undo2, AlertTriangle } from 'lucide-react';
+import { Activity, GitCommit, Play, Square, Terminal, Cpu, Network, BarChart3, Database, Users, Undo2, AlertTriangle, ArrowRight } from 'lucide-react';
 import { AreaChart, Area, CartesianGrid, Tooltip, ResponsiveContainer, YAxis } from 'recharts';
 import { InferenceEvent, DecisionObject, SimulationMode, DistributionStats } from './types';
 import { StreamingStats } from './services/statsEngine';
 import { compileDecision } from './services/decisionCompiler';
-import { narrateDecision } from './services/analysisService';
+import { getDecisionHighlights } from './services/analysisService';
 
 // --- SIMULATION LAYER (INPUT DATA ONLY) ---
 const PROMPT_CLASSES = ['summarization', 'extraction', 'reporting', 'chat'];
@@ -61,7 +61,6 @@ const App: React.FC = () => {
   const [mode, setMode] = useState<SimulationMode>(SimulationMode.IDLE);
   const [events, setEvents] = useState<InferenceEvent[]>([]);
   const [latestDecision, setLatestDecision] = useState<DecisionObject | null>(null);
-  const [narration, setNarration] = useState<string | null>(null);
   const [stats, setStats] = useState<DistributionStats | null>(null);
   
   // Sequence counter for unique IDs
@@ -90,7 +89,6 @@ const App: React.FC = () => {
             const decision = compileDecision(newEvents);
             if (decision) {
                 setLatestDecision(decision);
-                narrateDecision(decision).then(text => setNarration(text));
             }
           }
 
@@ -105,10 +103,11 @@ const App: React.FC = () => {
     setMode(SimulationMode.IDLE);
     setEvents([]);
     setLatestDecision(null);
-    setNarration(null);
     setStats(null);
     seqRef.current = 0;
   };
+
+  const highlights = latestDecision ? getDecisionHighlights(latestDecision) : null;
 
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-300 font-sans p-6 selection:bg-indigo-500/30">
@@ -230,17 +229,44 @@ const App: React.FC = () => {
                     <div className="text-[10px] text-zinc-600 font-mono">v2.1.1-diagnostic</div>
                 </div>
                 <div className="flex-1 bg-zinc-950 p-4 overflow-auto relative group">
-                    {latestDecision ? (
+                    {latestDecision && highlights ? (
                         <>
-                            {/* Gemini Narration Overlay */}
-                            <div className="mb-4 pb-4 border-b border-zinc-800/50">
-                                <div className="flex items-center gap-2 text-indigo-400 mb-2">
-                                    <Bot size={14} />
-                                    <span className="text-[10px] font-bold uppercase">AI Narrator (Explanation Only)</span>
+                            {/* Visual Insights Overlay (Deterministic) */}
+                            <div className="mb-4 pb-4 border-b border-zinc-800/50 grid grid-cols-2 gap-3">
+                                <div className={`col-span-2 flex items-center gap-3 p-3 rounded-lg border bg-${highlights.color}-500/5 border-${highlights.color}-500/20`}>
+                                     <div className={`p-2 rounded-full bg-${highlights.color}-500/10 text-${highlights.color}-500`}>
+                                         <highlights.Icon size={20} />
+                                     </div>
+                                     <div className="flex-1">
+                                         <div className={`text-[10px] font-bold uppercase tracking-wider text-${highlights.color}-500 mb-0.5`}>
+                                             {highlights.label}
+                                         </div>
+                                         <div className="text-sm font-semibold text-zinc-200 leading-tight">
+                                             {highlights.headline}
+                                         </div>
+                                     </div>
                                 </div>
-                                <p className="text-xs text-zinc-300 leading-relaxed font-medium">
-                                    {narration || <span className="animate-pulse text-zinc-600">Generating explanation...</span>}
-                                </p>
+
+                                <div className="bg-zinc-900/50 p-3 rounded border border-zinc-800/50 flex flex-col justify-center">
+                                     <div className="flex items-center gap-2 mb-1.5">
+                                         <highlights.DriverIcon size={12} className="text-indigo-400" />
+                                         <span className="text-[10px] text-zinc-500 uppercase tracking-wide">Root Cause</span>
+                                     </div>
+                                     <div className="text-xs text-zinc-300 font-medium leading-snug">
+                                         {highlights.subhead}
+                                     </div>
+                                </div>
+
+                                <div className="bg-zinc-900/50 p-3 rounded border border-zinc-800/50 flex flex-col justify-center">
+                                     <div className="flex items-center gap-2 mb-1.5">
+                                         <Activity size={12} className="text-emerald-400" />
+                                         <span className="text-[10px] text-zinc-500 uppercase tracking-wide">Response</span>
+                                     </div>
+                                     <div className="text-xs text-emerald-400 font-mono flex items-center gap-1">
+                                         {highlights.action}
+                                         <ArrowRight size={10} />
+                                     </div>
+                                </div>
                             </div>
                             
                             {/* Formatted Decision View for Humans (in addition to JSON) */}
@@ -296,7 +322,7 @@ const App: React.FC = () => {
                         </>
                     ) : (
                         <div className="flex flex-col items-center justify-center h-full text-zinc-700 gap-2">
-                            <Bot size={24} />
+                            <Terminal size={24} />
                             <span className="text-xs font-mono">Awaiting Decision Compilation...</span>
                         </div>
                     )}
@@ -333,7 +359,7 @@ const App: React.FC = () => {
                         {/* Noise Warning */}
                         {latestDecision.proof.noise_context && (
                             <div className="mt-2 text-[9px] text-amber-500/80 bg-amber-500/5 p-2 rounded border border-amber-500/10 flex items-center gap-2">
-                                <ShieldAlert size={12} />
+                                <AlertTriangle size={12} />
                                 {latestDecision.proof.noise_context}
                             </div>
                         )}

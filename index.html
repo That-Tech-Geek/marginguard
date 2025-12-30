@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="MarginGuard AI - Real-time Inference Cost Control & Forecasting" />
     <title>MarginGuard AI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -18,6 +19,7 @@
               warning: '#f59e0b', // amber-500
             },
             fontFamily: {
+              sans: ['ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'Helvetica Neue', 'Arial', 'sans-serif'],
               mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', "Liberation Mono", "Courier New", 'monospace'],
             }
           }
@@ -25,9 +27,16 @@
       }
     </script>
     <style>
-      body {
+      html, body {
+        height: 100%;
+        margin: 0;
         background-color: #09090b;
         color: #f4f4f5;
+      }
+      #root {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
       }
       /* Custom scrollbar for logs */
       .scrollbar-hide::-webkit-scrollbar {
@@ -38,16 +47,16 @@
           scrollbar-width: none;
       }
     </style>
-  <script type="importmap">
+<script type="importmap">
 {
   "imports": {
-    "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
-    "recharts": "https://esm.sh/recharts@^3.6.0",
+    "react": "https://esm.sh/react@^19.2.3",
     "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
     "react/": "https://esm.sh/react@^19.2.3/",
-    "react": "https://esm.sh/react@^19.2.3",
-    "uuid": "https://esm.sh/uuid@^13.0.0",
-    "@google/genai": "https://esm.sh/@google/genai@^1.34.0"
+    "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
+    "recharts": "https://esm.sh/recharts@^3.6.0",
+    "vite": "https://esm.sh/vite@^7.3.0",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2"
   }
 }
 </script>
