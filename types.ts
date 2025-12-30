@@ -45,3 +45,15 @@ export enum SimulationMode {
   NORMAL = 'NORMAL',
   SPIKE = 'SPIKE'
 }
+
+export interface OptimizationRecommendation {
+  trigger: string;
+  action: string;
+  impact: string;
+  confidence: 'High' | 'Medium' | 'Low';
+}
+
+export interface AnalysisResult {
+  summary: string;
+  recommendations: OptimizationRecommendation[];
+}
