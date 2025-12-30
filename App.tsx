@@ -377,7 +377,7 @@ const App: React.FC = () => {
                                 <div className={`w-2 h-2 rounded-full ${financials.variance > 0.15 ? 'bg-amber-500 animate-pulse' : 'bg-zinc-700'}`}></div>
                                 <div className="text-xs">
                                     <div className="font-medium">Protocol A: Downgrade High-Tier</div>
-                                    <div className="text-[10px] opacity-70">Trigger: Variance > 15%</div>
+                                    <div className="text-[10px] opacity-70">Trigger: Variance &gt; 15%</div>
                                 </div>
                             </div>
                             <Activity size={14} />
@@ -392,7 +392,7 @@ const App: React.FC = () => {
                                 <div className={`w-2 h-2 rounded-full ${financials.variance > 0.5 ? 'bg-rose-500 animate-pulse' : 'bg-zinc-700'}`}></div>
                                 <div className="text-xs">
                                     <div className="font-medium">Protocol B: Deny Non-Critical</div>
-                                    <div className="text-[10px] opacity-70">Trigger: Variance > 50%</div>
+                                    <div className="text-[10px] opacity-70">Trigger: Variance &gt; 50%</div>
                                 </div>
                             </div>
                             <Shield size={14} />
